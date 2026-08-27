@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vites
 import { spawn, spawnSync } from "child_process";
 import {
   AvailableCommand,
+  ClientCapabilities,
   client as acpClient,
   CreateElicitationRequest,
   CreateElicitationResponse,
@@ -18,6 +19,8 @@ import {
   WriteTextFileRequest,
   WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
+import type { AcpSessionNotification } from "../acp-subagents.js";
+import { NativeSubagentRuntime } from "../native-subagents.js";
 import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";
 import {
   markdownEscape,
@@ -749,7 +752,12 @@ describe("tool conversions", () => {
 
       expect(notifications[0]?.update).toMatchObject({
         sessionUpdate: "tool_call",
-        _meta: { claudeCode: { toolName: name, subagent: true } },
+        _meta: {
+          claudeCode: {
+            toolName: name,
+            subagent: true,
+          },
+        },
       });
     }
 
@@ -2131,14 +2139,43 @@ describe("subagent transcript replay", () => {
     },
   ] as Awaited<ReturnType<typeof getSessionMessages>>;
 
-  async function replay(capable: boolean): Promise<SessionNotification[]> {
-    const updates: SessionNotification[] = [];
+  const agentResult = (isError: boolean, content: string) =>
+    ({
+      type: "user",
+      uuid: `agent-result-${content}`,
+      session_id: "s1",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "parent-agent-call",
+            is_error: isError,
+            content,
+          },
+        ],
+      },
+    }) as unknown as Awaited<ReturnType<typeof getSessionMessages>>[number];
+
+  async function replay(
+    capability: "native" | "legacy" | false,
+    history = replayHistory,
+  ): Promise<AcpSessionNotification[]> {
+    const updates: AcpSessionNotification[] = [];
     const client = {
-      sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      sessionUpdate: async (update: SessionNotification) =>
+        updates.push(update as AcpSessionNotification),
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-    (agent as any).clientCapabilities = capable ? { _meta: { "subagent-transcript": true } } : {};
-    vi.mocked(getSessionMessages).mockResolvedValueOnce(replayHistory);
+    (agent as any).clientCapabilities =
+      capability === "native"
+        ? { subagents: {} }
+        : capability === "legacy"
+          ? { _meta: { "subagent-transcript": true } }
+          : {};
+    vi.mocked(getSessionMessages).mockResolvedValueOnce(history);
 
     await (
       agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
@@ -2146,30 +2183,164 @@ describe("subagent transcript replay", () => {
     return updates;
   }
 
-  it("preserves nested text and child tool attribution for capable clients", async () => {
-    const updates = await replay(true);
-    expect(updates).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          update: expect.objectContaining({
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "nested report" },
-            _meta: expect.objectContaining({
-              claudeCode: expect.objectContaining({ parentToolUseId: "parent-agent-call" }),
-            }),
-          }),
-        }),
-        expect.objectContaining({
-          update: expect.objectContaining({
-            sessionUpdate: "tool_call",
-            toolCallId: "child-tool",
-            _meta: expect.objectContaining({
-              claudeCode: expect.objectContaining({ parentToolUseId: "parent-agent-call" }),
-            }),
-          }),
-        }),
-      ]),
-    );
+  it("replays an unattributed sidechain as a deterministic disconnected child", async () => {
+    const updates = await replay("native");
+    expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
+      ["s1", "subagent_spawned"],
+      ["s1:replay-subagent:parent-agent-call", "agent_message_chunk"],
+      ["s1:replay-subagent:parent-agent-call", "tool_call"],
+      ["s1", "subagent_state_update"],
+    ]);
+    expect(updates[0]?.update).toMatchObject({
+      subagentSessionId: "s1:replay-subagent:parent-agent-call",
+      name: "Disconnected agent",
+    });
+    expect(updates.at(-1)?.update).toMatchObject({ state: "disconnected" });
+  });
+
+  it("reconstructs a persisted Agent launch before child updates", async () => {
+    const launch = {
+      type: "assistant" as const,
+      uuid: "launch-message",
+      session_id: "s1",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      message: {
+        id: "api-launch-message",
+        model: "claude-sonnet-4-5",
+        role: "assistant" as const,
+        type: "message",
+        stop_reason: "tool_use",
+        content: [
+          {
+            type: "tool_use" as const,
+            id: "parent-agent-call",
+            name: "Agent",
+            input: { name: "Reviewer", prompt: "Review the implementation" },
+          },
+        ],
+      },
+    };
+    const updates = await replay("native", [launch, ...replayHistory, agentResult(false, "done")]);
+
+    expect(updates[0]?.update).toMatchObject({
+      sessionUpdate: "subagent_spawned",
+      name: "Reviewer",
+      task: "Review the implementation",
+    });
+    expect(updates.at(-1)?.update).toMatchObject({
+      sessionUpdate: "subagent_state_update",
+      state: "completed",
+    });
+    expect(
+      updates.some(
+        ({ update }) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update.toolCallId === "parent-agent-call",
+      ),
+    ).toBe(false);
+  });
+
+  it.each([
+    { content: "subagent failed", state: "failed" },
+    { content: "Request interrupted by user", state: "cancelled" },
+  ])("restores a persisted $state Agent result", async ({ content, state }) => {
+    const launch = {
+      type: "assistant" as const,
+      uuid: "launch-message",
+      session_id: "s1",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      message: {
+        id: "api-launch-message",
+        model: "claude-sonnet-4-5",
+        role: "assistant" as const,
+        type: "message",
+        stop_reason: "tool_use",
+        content: [
+          {
+            type: "tool_use" as const,
+            id: "parent-agent-call",
+            name: "Agent",
+            input: { name: "Reviewer", prompt: "Review" },
+          },
+        ],
+      },
+    };
+
+    const updates = await replay("native", [launch, ...replayHistory, agentResult(true, content)]);
+    expect(updates.at(-1)?.update).toMatchObject({
+      sessionUpdate: "subagent_state_update",
+      state,
+    });
+  });
+
+  it("marks a launched child without a persisted result as disconnected", async () => {
+    const launch = {
+      type: "assistant" as const,
+      uuid: "launch-message",
+      session_id: "s1",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      message: {
+        id: "api-launch-message",
+        model: "claude-sonnet-4-5",
+        role: "assistant" as const,
+        type: "message",
+        stop_reason: "tool_use",
+        content: [
+          {
+            type: "tool_use" as const,
+            id: "parent-agent-call",
+            name: "Agent",
+            input: { name: "Reviewer", prompt: "Review" },
+          },
+        ],
+      },
+    };
+
+    const updates = await replay("native", [launch, ...replayHistory]);
+    expect(updates.at(-1)?.update).toMatchObject({
+      sessionUpdate: "subagent_state_update",
+      state: "disconnected",
+    });
+  });
+
+  it("breaks malformed replay lineage cycles deterministically", async () => {
+    const cyclicLaunch = (id: string, parentToolUseId: string) => ({
+      type: "assistant" as const,
+      uuid: `launch-${id}`,
+      session_id: "s1",
+      parent_tool_use_id: parentToolUseId,
+      parent_agent_id: "malformed",
+      message: {
+        id: `api-launch-${id}`,
+        model: "claude-sonnet-4-5",
+        role: "assistant" as const,
+        type: "message",
+        stop_reason: "tool_use",
+        content: [{ type: "tool_use" as const, id, name: "Agent", input: { prompt: `Run ${id}` } }],
+      },
+    });
+
+    const updates = await replay("native", [
+      cyclicLaunch("agent-a", "agent-b"),
+      cyclicLaunch("agent-b", "agent-a"),
+      {
+        ...replayHistory[0],
+        parent_tool_use_id: "agent-a",
+      },
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    expect(
+      updates.filter(({ update }) => update.sessionUpdate === "subagent_spawned"),
+    ).toHaveLength(2);
+    expect(
+      updates.some(
+        ({ update }) =>
+          update.sessionUpdate === "subagent_state_update" && update.state === "disconnected",
+      ),
+    ).toBe(true);
   });
 
   it("keeps legacy text filtering without losing child tool attribution", async () => {
@@ -2187,6 +2358,23 @@ describe("subagent transcript replay", () => {
               claudeCode: expect.objectContaining({ parentToolUseId: "parent-agent-call" }),
             }),
           }),
+        }),
+      ]),
+    );
+  });
+
+  it("replays the flattened transcript for the legacy opt-in", async () => {
+    const updates = await replay("legacy");
+    expect(updates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "nested report" },
+          }),
+        }),
+        expect.objectContaining({
+          update: expect.objectContaining({ sessionUpdate: "tool_call", toolCallId: "child-tool" }),
         }),
       ]),
     );
@@ -3396,6 +3584,12 @@ describe("canUseTool in bypassPermissions mode", () => {
 });
 
 describe("subagent permission attribution (issue #851)", () => {
+  const SUBAGENT_TEST_USAGE = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  };
   // A background subagent's permission requests reach canUseTool with only an
   // `agentID`; the streamed subagent messages carry `parent_tool_use_id`
   // instead. `task_started` bridges the two (for subagent tasks its `task_id`
@@ -3405,6 +3599,7 @@ describe("subagent permission attribution (issue #851)", () => {
   function setup() {
     const updates: SessionNotification[] = [];
     const requests: RequestPermissionRequest[] = [];
+    const elicitations: CreateElicitationRequest[] = [];
     const log = vi.fn();
     const mockClient = {
       sessionUpdate: async (n: SessionNotification) => {
@@ -3414,13 +3609,20 @@ describe("subagent permission attribution (issue #851)", () => {
         requests.push(params);
         return { outcome: { outcome: "selected", optionId: "allow-once" } };
       },
+      unstable_createElicitation: async (request: CreateElicitationRequest) => {
+        elicitations.push(request);
+        return {
+          action: "accept",
+          content: { question_0: "Fast", question_0_custom: "" },
+        };
+      },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log, error: () => {} });
     agent.sessions["session-1"] = mockSessionState();
-    return { agent, updates, requests, log, session: agent.sessions["session-1"]! };
+    return { agent, updates, requests, elicitations, log, session: agent.sessions["session-1"]! };
   }
 
-  it("attributes a subagent tool's eager tool_call and permission request to the spawning tool call", async () => {
+  it("keeps the legacy child tool call before its root permission request", async () => {
     const { agent, updates, requests, session } = setup();
     session.liveBackgroundTasks.set("agent-42", {
       parentToolUseId: "toolu_parent",
@@ -3439,10 +3641,47 @@ describe("subagent permission attribution (issue #851)", () => {
       toolCallId: "toolu_sub",
       _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
     });
-    // Keep the stable claudeCode metadata shape while adding the parent link.
-    expect(requests[0].toolCall._meta).toEqual({
+    expect(requests[0].sessionId).toBe("session-1");
+    expect(requests[0].toolCall._meta).toMatchObject({
       claudeCode: { toolName: "Bash", parentToolUseId: "toolu_parent" },
     });
+  });
+
+  it("forwards child elicitation to the root when native subagents were not negotiated", async () => {
+    const { agent, updates, requests, session } = setup();
+    (agent as any).clientCapabilities = { elicitation: { form: {} } };
+    session.liveBackgroundTasks.set("agent-42", {
+      parentToolUseId: "toolu_parent",
+      isSubagent: true,
+    });
+
+    const result = await agent.canUseTool("session-1")(
+      "AskUserQuestion",
+      {
+        questions: [
+          {
+            question: "Which mode?",
+            header: "Mode",
+            options: [
+              { label: "Fast", description: "Fast mode" },
+              { label: "Safe", description: "Safe mode" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_question",
+        agentID: "agent-42",
+      } as any,
+    );
+
+    expect(result).toMatchObject({ behavior: "allow" });
+    expect(updates).toHaveLength(1);
+    expect(updates[0].sessionId).toBe("session-1");
+    expect(requests).toEqual([]);
   });
 
   it("omits the attribution (and logs the miss) when the agent id has no recorded parent", async () => {
@@ -3455,8 +3694,10 @@ describe("subagent permission attribution (issue #851)", () => {
       agentID: "agent-unknown",
     } as any);
 
-    const meta = updates[0].update._meta as { claudeCode?: { parentToolUseId?: string } };
-    expect(meta.claudeCode?.parentToolUseId).toBeUndefined();
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_sub",
+    });
     expect(requests[0].toolCall._meta).toBeUndefined();
     // The task_id === agentID invariant is undocumented SDK behavior; a miss
     // must be observable so an SDK bump that breaks it doesn't regress silently.
@@ -3488,6 +3729,130 @@ describe("subagent permission attribution (issue #851)", () => {
       toolCallId: "toolu_sub",
       _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
     });
+  });
+
+  it("routes native child tool calls and permission requests to the child session", async () => {
+    const { agent, updates, requests, session } = setup();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as ClientCapabilities & {
+        subagents: Record<string, never>;
+      },
+    });
+    session.liveBackgroundTasks.set("agent-42", {
+      parentToolUseId: "toolu_parent",
+      isSubagent: true,
+    });
+    session.nativeSubagentsByTaskId = new Map([
+      [
+        "agent-42",
+        {
+          sessionId: "child-session",
+          parentSessionId: "session-1",
+          parentToolUseId: "toolu_parent",
+          name: "Explore",
+          task: "Investigate",
+          announced: true,
+        },
+      ],
+    ]);
+
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_sub",
+      agentID: "agent-42",
+    } as any);
+
+    expect(updates[0].sessionId).toBe("child-session");
+    expect(requests[0].sessionId).toBe("child-session");
+  });
+
+  it("keeps a raced permission on the root until the child is announced", async () => {
+    const { agent, updates, requests, session } = setup();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as ClientCapabilities & {
+        subagents: Record<string, never>;
+      },
+    });
+    session.liveBackgroundTasks.set("agent-42", {
+      parentToolUseId: "toolu_parent",
+      isSubagent: true,
+    });
+    session.nativeSubagentsByTaskId = new Map([
+      [
+        "agent-42",
+        {
+          sessionId: "child-session",
+          parentSessionId: "session-1",
+          parentToolUseId: "toolu_parent",
+          name: "Explore",
+          task: "Investigate",
+        },
+      ],
+    ]);
+
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_sub",
+      agentID: "agent-42",
+    } as any);
+
+    expect(updates[0].sessionId).toBe("session-1");
+    expect(requests[0].sessionId).toBe("session-1");
+  });
+
+  it("routes a native child AskUserQuestion and its tool call to the child session", async () => {
+    const { agent, updates, elicitations, session } = setup();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        subagents: {},
+        elicitation: { form: {} },
+      } as ClientCapabilities & { subagents: Record<string, never> },
+    });
+    session.liveBackgroundTasks.set("agent-42", {
+      parentToolUseId: "toolu_parent",
+      isSubagent: true,
+    });
+    session.nativeSubagentsByTaskId = new Map([
+      [
+        "agent-42",
+        {
+          sessionId: "child-session",
+          parentSessionId: "session-1",
+          parentToolUseId: "toolu_parent",
+          name: "Explore",
+          task: "Investigate",
+          announced: true,
+        },
+      ],
+    ]);
+
+    await agent.canUseTool("session-1")(
+      "AskUserQuestion",
+      {
+        questions: [
+          {
+            question: "Which mode?",
+            header: "Mode",
+            options: [{ label: "Fast", description: "Fast mode" }],
+            multiSelect: false,
+          },
+        ],
+      },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_question",
+        agentID: "agent-42",
+      } as any,
+    );
+
+    expect(updates[0].sessionId).toBe("child-session");
+    expect((elicitations[0] as { sessionId?: string }).sessionId).toBe("child-session");
   });
 
   function taskStarted(taskId: string, toolUseId: string) {
@@ -3633,6 +3998,1009 @@ describe("subagent permission attribution (issue #851)", () => {
     const map = agent.sessions["test-session"]!.liveBackgroundTasks;
     expect(map.has("agent-42")).toBe(false);
     expect(map.get("agent-43")?.parentToolUseId).toBe("toolu_parent_2");
+  });
+
+  it("keeps legacy Agent lifecycle and flattened child output without capability negotiation", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            id: randomUUID(),
+            role: "assistant",
+            model: "claude-sonnet-4-20250514",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_parent",
+                name: "Agent",
+                input: { description: "Investigate", subagent_type: "Explore" },
+              },
+            ],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: SUBAGENT_TEST_USAGE,
+          },
+        },
+        {
+          ...taskStarted("agent-42", "toolu_parent"),
+          subagent_type: "Explore",
+        },
+        {
+          type: "stream_event",
+          parent_tool_use_id: "toolu_parent",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "hidden child output" },
+          },
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(
+      updates.some(
+        ({ update }) =>
+          update.sessionUpdate === "subagent_spawned" ||
+          update.sessionUpdate === "subagent_state_update",
+      ),
+    ).toBe(false);
+    expect(
+      updates.some(({ update }) => JSON.stringify(update).includes("hidden child output")),
+    ).toBe(true);
+    expect(
+      updates.some(
+        ({ update }) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update.toolCallId === "toolu_parent",
+      ),
+    ).toBe(true);
+  });
+
+  it("emits native subagent lifecycle when both peers advertise support", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as ClientCapabilities & {
+        subagents: Record<string, never>;
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          ...taskStarted("agent-42", "toolu_parent"),
+          subagent_type: "Explore",
+        },
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "agent-42",
+          tool_use_id: "toolu_parent",
+          status: "completed",
+          output_file: "",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(updates.map((notification) => notification.update)).toEqual(
+      expect.arrayContaining([
+        {
+          sessionUpdate: "subagent_spawned",
+          subagentSessionId: "agent-42",
+          name: "Investigate",
+          task: "Investigate",
+          capabilities: {},
+        },
+        {
+          sessionUpdate: "subagent_state_update",
+          subagentSessionId: "agent-42",
+          state: "completed",
+        },
+      ]),
+    );
+  });
+
+  it("buffers child output until spawn and drops duplicates and late updates", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as ClientCapabilities & {
+        subagents: Record<string, never>;
+      },
+    });
+    const childMessage = (text: string) => ({
+      type: "stream_event" as const,
+      parent_tool_use_id: "toolu_parent",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta" as const,
+        index: 0,
+        delta: { type: "text_delta" as const, text },
+      },
+    });
+    const terminal = {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "agent-42",
+      tool_use_id: "toolu_parent",
+      status: "completed",
+      output_file: "",
+      summary: "done",
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+    const childTool = {
+      type: "assistant" as const,
+      parent_tool_use_id: "toolu_parent",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        id: randomUUID(),
+        role: "assistant" as const,
+        model: "claude-sonnet-4-20250514",
+        content: [
+          { type: "tool_use" as const, id: "toolu_child", name: "Bash", input: { command: "pwd" } },
+        ],
+        usage: SUBAGENT_TEST_USAGE,
+      },
+    };
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        childMessage("buffered"),
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        childTool,
+        childMessage("routed"),
+        terminal,
+        terminal,
+        childMessage("late"),
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
+      ["test-session", "subagent_spawned"],
+      ["agent-42", "agent_message_chunk"],
+      ["agent-42", "tool_call"],
+      ["agent-42", "agent_message_chunk"],
+      ["test-session", "subagent_state_update"],
+    ]);
+    expect(JSON.stringify(updates)).not.toContain("late");
+  });
+
+  it("uses the immediate child as parent for a nested subagent", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as ClientCapabilities & {
+        subagents: Record<string, never>;
+      },
+    });
+    const agentTool = (id: string, parent_tool_use_id: string | null) => ({
+      type: "assistant" as const,
+      parent_tool_use_id,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        id: randomUUID(),
+        role: "assistant" as const,
+        model: "claude-sonnet-4-20250514",
+        content: [
+          {
+            type: "tool_use" as const,
+            id,
+            name: "Agent",
+            input: {
+              name: `${id}-name`,
+              description: `${id} description`,
+              prompt: `${id} full prompt`,
+            },
+          },
+        ],
+        usage: SUBAGENT_TEST_USAGE,
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        agentTool("toolu_outer", null),
+        { ...taskStarted("agent-outer", "toolu_outer"), subagent_type: "Explore" },
+        // The SDK does not guarantee that task_started follows the assistant
+        // frame containing the spawning tool_use. Lineage must still attach
+        // the nested child to agent-outer, not to the root session.
+        { ...taskStarted("agent-inner", "toolu_inner"), subagent_type: "Explore" },
+        agentTool("toolu_inner", "toolu_outer"),
+        {
+          type: "system",
+          subtype: "task_updated",
+          task_id: "agent-inner",
+          patch: { status: "completed" },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        {
+          type: "system",
+          subtype: "task_updated",
+          task_id: "agent-outer",
+          patch: { status: "completed" },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const nestedSpawn = updates.find(
+      ({ update }) =>
+        update.sessionUpdate === "subagent_spawned" && update.subagentSessionId === "agent-inner",
+    );
+    expect(nestedSpawn?.sessionId).toBe("agent-outer");
+    expect(nestedSpawn?.update).toMatchObject({
+      name: "toolu_inner-name",
+      task: "toolu_inner full prompt",
+    });
+    expect(
+      updates.find(
+        ({ update }) =>
+          update.sessionUpdate === "subagent_spawned" && update.subagentSessionId === "agent-outer",
+      )?.update,
+    ).toMatchObject({
+      name: "toolu_outer-name",
+      task: "toolu_outer full prompt",
+    });
+    expect(
+      updates.filter(
+        ({ update }) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          (update._meta?.claudeCode as { toolName?: string } | undefined)?.toolName === "Agent",
+      ),
+    ).toEqual([]);
+  });
+
+  it("fails an announced child if the provider stream ends without a terminal event", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as ClientCapabilities & {
+        subagents: Record<string, never>;
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(updates.at(-1)).toEqual({
+      sessionId: "test-session",
+      update: {
+        sessionUpdate: "subagent_state_update",
+        subagentSessionId: "agent-42",
+        state: "failed",
+      },
+    });
+  });
+
+  it("maps the SDK stopped terminal status to ACP cancelled", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as ClientCapabilities & {
+        subagents: Record<string, never>;
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "agent-42",
+          tool_use_id: "toolu_parent",
+          status: "stopped",
+          output_file: "",
+          summary: "stopped",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(updates.at(-1)?.update).toEqual({
+      sessionUpdate: "subagent_state_update",
+      subagentSessionId: "agent-42",
+      state: "cancelled",
+    });
+  });
+
+  it("finishes every announced child as cancelled when the parent is cancelled", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as ClientCapabilities & {
+        subagents: Record<string, never>;
+      },
+    });
+    let childStarted!: () => void;
+    const started = new Promise<void>((resolve) => (childStarted = resolve));
+    let releaseStream!: () => void;
+    const released = new Promise<void>((resolve) => (releaseStream = resolve));
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const iter = input[Symbol.asyncIterator]();
+        const user = await iter.next();
+        yield userEcho(user.value);
+        yield { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" };
+        childStarted();
+        await released;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messages();
+    });
+
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+    await started;
+    await agent.cancel({ sessionId: "test-session" });
+    releaseStream();
+    await prompt;
+
+    expect(updates.slice(-2).map(({ update }) => update)).toEqual([
+      {
+        sessionUpdate: "subagent_spawned",
+        subagentSessionId: "agent-42",
+        name: "Investigate",
+        task: "Investigate",
+        capabilities: {},
+      },
+      {
+        sessionUpdate: "subagent_state_update",
+        subagentSessionId: "agent-42",
+        state: "cancelled",
+      },
+    ]);
+  });
+
+  it("bounds unattributed child output while waiting for its spawn", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const logs: string[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: (message) => logs.push(String(message)), error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as ClientCapabilities & {
+        subagents: Record<string, never>;
+      },
+    });
+    const childMessages = Array.from({ length: 40 }, (_, index) => ({
+      type: "stream_event" as const,
+      parent_tool_use_id: "toolu_parent",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta" as const,
+        index: 0,
+        delta: { type: "text_delta" as const, text: `chunk-${index}` },
+      },
+    }));
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        ...childMessages,
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "agent-42",
+          tool_use_id: "toolu_parent",
+          status: "completed",
+          output_file: "",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(
+      updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk"),
+    ).toHaveLength(32);
+    expect(logs).toContainEqual(expect.stringContaining("pending buffer limit reached"));
+  });
+
+  it("propagates a terminal SDK output_file through the async task lifecycle", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          ...taskStarted("workflow-1", "toolu_workflow"),
+          task_type: "local_workflow",
+          workflow_name: "assets",
+          is_backgrounded: true,
+        },
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "workflow-1",
+          tool_use_id: "toolu_workflow",
+          status: "completed",
+          output_file: "/tmp/tasks/workflow-1.output",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(updates.map(({ update }) => update)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sessionUpdate: "async_task_spawned",
+          asyncTaskId: "workflow-1",
+          name: "assets",
+        }),
+        expect.objectContaining({
+          sessionUpdate: "async_task_state_update",
+          asyncTaskId: "workflow-1",
+          state: "completed",
+          outputFilePath: "/tmp/tasks/workflow-1.output",
+        }),
+      ]),
+    );
+  });
+
+  it("stops one advertised async task through the SDK without cancelling the prompt", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          ...taskStarted("workflow-1", "toolu_workflow"),
+          task_type: "local_workflow",
+          is_backgrounded: true,
+        },
+        successResult(),
+      ]),
+    );
+    const query = agent.sessions["test-session"].query as any;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+    query.stopTask.mockRejectedValueOnce(new Error("SDK stop failed"));
+    await expect(
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "workflow-1" }),
+    ).rejects.toThrow("SDK stop failed");
+    await expect(
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "workflow-1" }),
+    ).resolves.toEqual({ stopped: true });
+
+    expect(query.stopTask).toHaveBeenCalledTimes(2);
+    expect(query.stopTask).toHaveBeenNthCalledWith(1, "workflow-1");
+    expect(query.stopTask).toHaveBeenNthCalledWith(2, "workflow-1");
+    expect(query.interrupt).not.toHaveBeenCalled();
+    expect(updates.map(({ update }) => update)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sessionUpdate: "async_task_spawned",
+          asyncTaskId: "workflow-1",
+          canStop: true,
+        }),
+        expect.objectContaining({
+          sessionUpdate: "async_task_state_update",
+          asyncTaskId: "workflow-1",
+          state: "stopped",
+        }),
+      ]),
+    );
+    // One transcript line for the two stop attempts: the failed one never
+    // reached a terminal state, and the retry says it once.
+    expect(
+      updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk"),
+    ).toHaveLength(1);
+    expect(updates.at(-1)?.update).toMatchObject({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text" },
+    });
+  });
+
+  it("attaches a Bash tool id discovered after async_task_spawned", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "bash-tool",
+                name: "Bash",
+                input: { command: "npm run build", run_in_background: true },
+              },
+            ],
+            usage: SUBAGENT_TEST_USAGE,
+          },
+        },
+        {
+          type: "system",
+          subtype: "task_started",
+          task_id: "shell-1",
+          task_type: "local_bash",
+          description: "Build",
+          is_backgrounded: true,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        {
+          type: "user",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          tool_use_result: { backgroundTaskId: "shell-1" },
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "bash-tool",
+                content:
+                  "Command running in background. Output is being written to: /tmp/tasks/shell-1.output. You will be notified when it completes.",
+              },
+            ],
+          },
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const lifecycle = updates
+      .map(({ update }) => update)
+      .filter(
+        (update) =>
+          update.sessionUpdate === "async_task_spawned" ||
+          update.sessionUpdate === "async_task_progress",
+      );
+    expect(lifecycle[0]).toMatchObject({
+      sessionUpdate: "async_task_spawned",
+      asyncTaskId: "shell-1",
+    });
+    expect(lifecycle[0]).not.toHaveProperty("toolCallId");
+    expect(lifecycle[1]).toMatchObject({
+      sessionUpdate: "async_task_progress",
+      asyncTaskId: "shell-1",
+      toolCallId: "bash-tool",
+      outputFilePath: "/tmp/tasks/shell-1.output",
+    });
+
+    // The Bash card completes as soon as the command detaches, so this marker is
+    // the only thing telling a client it is backgrounded work, not finished work.
+    const bashUpdate = updates
+      .map(({ update }) => update)
+      .findLast(
+        (update) =>
+          update.sessionUpdate === "tool_call_update" && update.toolCallId === "bash-tool",
+      );
+    expect(bashUpdate).toMatchObject({
+      status: "completed",
+      _meta: {
+        jetbrains: { air: { version: 1, asyncTasks: { backgrounded: true } } },
+      },
+    });
+    // Agent-native tool metadata keeps its own namespace alongside it.
+    expect(bashUpdate?._meta?.claudeCode).toMatchObject({ toolName: "Bash" });
+  });
+
+  it("omits the background task link for a client without the asyncTasks capability", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "bash-tool",
+                name: "Bash",
+                input: { command: "npm run build", run_in_background: true },
+              },
+            ],
+            usage: SUBAGENT_TEST_USAGE,
+          },
+        },
+        {
+          type: "user",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          tool_use_result: { backgroundTaskId: "shell-1" },
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "bash-tool",
+                content:
+                  "Command running in background. Output is being written to: /tmp/tasks/shell-1.output. You will be notified when it completes.",
+              },
+            ],
+          },
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    // The id would name an `async_task_spawned` this client is never sent.
+    const bashUpdate = updates
+      .map(({ update }) => update)
+      .findLast(
+        (update) =>
+          update.sessionUpdate === "tool_call_update" && update.toolCallId === "bash-tool",
+      );
+    expect(bashUpdate).toMatchObject({ status: "completed" });
+    expect(bashUpdate?._meta).not.toHaveProperty("jetbrains");
+  });
+});
+
+describe("native subagent eager tool ownership", () => {
+  it("completes an Agent card created by a permission after its control frame was suppressed", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+        requestPermission: async () => ({
+          outcome: { outcome: "selected", optionId: "allow-once" },
+        }),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as ClientCapabilities & {
+        subagents: Record<string, never>;
+      },
+    });
+    let controlConsumed!: () => void;
+    const consumed = new Promise<void>((resolve) => (controlConsumed = resolve));
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const iter = input[Symbol.asyncIterator]();
+        const user = await iter.next();
+        yield userEcho(user.value);
+        yield {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_agent",
+                name: "Agent",
+                input: { description: "Investigate", prompt: "Find the bug" },
+              },
+            ],
+            usage: {},
+          },
+        };
+        controlConsumed();
+        await released;
+        yield {
+          type: "system",
+          subtype: "task_started",
+          task_id: "agent-1",
+          tool_use_id: "toolu_agent",
+          subagent_type: "Explore",
+          description: "Investigate",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield {
+          type: "user",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_agent", content: "done" }],
+          },
+        };
+        yield {
+          type: "result",
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: false,
+          result: "",
+          errors: [],
+          duration_ms: 0,
+          duration_api_ms: 0,
+          num_turns: 1,
+          total_cost_usd: 0,
+          usage: {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          modelUsage: {},
+          permission_denials: [],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messages();
+    });
+
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+    await consumed;
+    await agent.canUseTool("test-session")(
+      "Agent",
+      { description: "Investigate", prompt: "Find the bug" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_agent",
+      } as any,
+    );
+    release();
+    await prompt;
+
+    const controlUpdates = updates.filter(
+      ({ update }) =>
+        (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+        update.toolCallId === "toolu_agent",
+    );
+    expect(controlUpdates.map(({ sessionId }) => sessionId)).toEqual([
+      "test-session",
+      "test-session",
+    ]);
+    expect(
+      controlUpdates.map(({ update }) => ("status" in update ? update.status : undefined)),
+    ).toEqual(["pending", "completed"]);
+  });
+
+  it("keeps permission-visible Agent control lifecycle in its original session", async () => {
+    const published: AcpSessionNotification[] = [];
+    const session = {
+      nativeSubagentsByTaskId: new Map(),
+      nativeSubagentTaskIdByToolUseId: new Map(),
+      nativeSubagentParentByToolUseId: new Map(),
+    };
+    const runtime = new NativeSubagentRuntime(
+      true,
+      "root",
+      session,
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+    );
+    await runtime.taskStarted(
+      {
+        taskId: "agent-1",
+        toolUseId: "toolu_agent",
+        subagentType: "Explore",
+        description: "Investigate",
+      },
+      async (notification) => {
+        published.push(notification);
+      },
+    );
+    const control = {
+      sessionId: "root",
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_agent",
+        status: "completed",
+        rawInput: { description: "Investigate", prompt: "Find the bug" },
+        _meta: { claudeCode: { toolName: "Agent", subagent: true } },
+      },
+    } as AcpSessionNotification;
+
+    const routed = await runtime.route(control, async () => {}, "root");
+
+    expect(routed).toEqual(control);
+    expect(published[0]).toMatchObject({
+      sessionId: "root",
+      update: { sessionUpdate: "subagent_spawned", subagentSessionId: "agent-1" },
+    });
+  });
+
+  it("pins a raced child tool lifecycle to the root where permission created it", async () => {
+    const session = {
+      nativeSubagentsByTaskId: new Map([
+        [
+          "agent-1",
+          {
+            sessionId: "agent-1",
+            parentSessionId: "root",
+            parentToolUseId: "toolu_agent",
+            name: "Explore",
+            task: "Investigate",
+            announced: true,
+          },
+        ],
+      ]),
+      nativeSubagentTaskIdByToolUseId: new Map([["toolu_agent", "agent-1"]]),
+      nativeSubagentParentByToolUseId: new Map(),
+    };
+    const runtime = new NativeSubagentRuntime(true, "root", session, async () => {}, {
+      log: () => {},
+    });
+    const terminal = {
+      sessionId: "root",
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_child",
+        status: "completed",
+        _meta: { claudeCode: { toolName: "Bash", parentToolUseId: "toolu_agent" } },
+      },
+    } as AcpSessionNotification;
+
+    await expect(runtime.route(terminal, async () => {}, "root")).resolves.toEqual(terminal);
+    await expect(runtime.route(terminal, async () => {})).resolves.toMatchObject({
+      sessionId: "agent-1",
+    });
   });
 });
 
@@ -6189,6 +7557,42 @@ describe("logout", () => {
     expect(response.agentCapabilities?.auth?.logout).toEqual({});
   });
 
+  it("advertises the agent subagent capability independently of client negotiation", async () => {
+    const agent = createMockAgent();
+    const unsupported = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    const supported = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as ClientCapabilities & {
+        subagents: Record<string, never>;
+      },
+    });
+
+    expect(
+      (unsupported.agentCapabilities?.sessionCapabilities as { subagents?: unknown }).subagents,
+    ).toEqual({});
+    expect(
+      (supported.agentCapabilities?.sessionCapabilities as { subagents?: unknown }).subagents,
+    ).toEqual({});
+  });
+
+  it("negotiates subagents through AIR metadata when the SDK strips the draft field", async () => {
+    const agent = createMockAgent();
+    const supported = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: {
+          jetbrains: {
+            air: { version: 1, capabilities: ["nativeSubagentSessions"] },
+          },
+        },
+      },
+    });
+
+    expect(
+      (supported.agentCapabilities?.sessionCapabilities as { subagents?: unknown }).subagents,
+    ).toEqual({});
+  });
+
   it("advertises canonical AIR sessionFailure support during initialize", async () => {
     const agent = createMockAgent();
     const response = await agent.initialize({
@@ -6204,7 +7608,12 @@ describe("logout", () => {
 
     expect((response._meta as any)?.jetbrains?.air).toEqual({
       version: 1,
-      capabilities: ["sessionFailure", "agentFileChangeReport"],
+      capabilities: [
+        "sessionFailure",
+        "agentFileChangeReport",
+        "nativeSubagentSessions",
+        "asyncTasks",
+      ],
     });
   });
 
@@ -6217,7 +7626,12 @@ describe("logout", () => {
 
     expect((response._meta as any)?.jetbrains?.air).toEqual({
       version: 1,
-      capabilities: ["sessionFailure", "agentFileChangeReport"],
+      capabilities: [
+        "sessionFailure",
+        "agentFileChangeReport",
+        "nativeSubagentSessions",
+        "asyncTasks",
+      ],
     });
   });
 });
@@ -8392,7 +9806,7 @@ describe("assembled assistant text fallback", () => {
     expect(thoughtChunkTexts(updates)).toEqual([]);
   });
 
-  it("forwards subagent text and thinking as nested chunks for capable clients", async () => {
+  it("forwards subagent text and thinking through the legacy transcript extension", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     (agent as any).clientCapabilities = { _meta: { "subagent-transcript": true } };
     injectSession(agent, [
@@ -8417,9 +9831,7 @@ describe("assembled assistant text fallback", () => {
     );
     expect(nestedUpdates).toHaveLength(2);
     for (const { update } of nestedUpdates) {
-      expect(update._meta).toMatchObject({
-        claudeCode: { parentToolUseId: "tool_use_1" },
-      });
+      expect(update._meta).toMatchObject({ claudeCode: { parentToolUseId: "tool_use_1" } });
     }
     expect(messageChunkTexts(updates)).toContain("nested report");
     expect(thoughtChunkTexts(updates)).toContain("checking");
@@ -9645,6 +11057,31 @@ describe("post-error recovery", () => {
     expect(agent.sessions["test-session"].abortController.signal.aborted).toBe(false);
   });
 
+  it("still interrupts and cleans up when native subagent cancellation publication fails", async () => {
+    const errors: unknown[][] = [];
+    const agent = new ClaudeAcpAgent({} as AcpClient, {
+      log: () => {},
+      error: (...args) => errors.push(args),
+    });
+    async function* emptyQuery() {}
+    const session = mockSessionState({
+      query: wrapQuery(emptyQuery()),
+      nativeSubagentRuntime: {
+        finishAll: vi.fn(async () => {
+          throw new Error("client disconnected");
+        }),
+      } as unknown as NativeSubagentRuntime,
+      eagerToolCallSessions: new Map([["tool", "test-session"]]),
+    });
+    agent.sessions["test-session"] = session;
+
+    await expect(agent.cancel({ sessionId: "test-session" })).resolves.toBeUndefined();
+
+    expect(session.query.interrupt).toHaveBeenCalledOnce();
+    expect(session.eagerToolCallSessions).toEqual(new Map());
+    expect(errors.flat().join(" ")).toContain("failed to publish cancelled subagent state");
+  });
+
   it("settles a turn that ends via the stream-done path even if releasing resources throws", async () => {
     const agent = createMockAgent();
     // The turn is activated by its echo but the stream then ends with NO terminal
@@ -9960,6 +11397,9 @@ describe("post-error recovery", () => {
 
     await agent.cancel({ sessionId: "test-session" }); // counts turn 2, then the receipt uncounts it
     expect(agent.sessions["test-session"]?.pendingOrphanResults).toBe(0);
+    expect(
+      agent.sessions["test-session"]?.pendingEmptyInterruptionDiagnosticCommands?.size ?? 0,
+    ).toBe(0);
     const compact = agent.prompt({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "/compact" }],
@@ -10033,6 +11473,9 @@ describe("post-error recovery", () => {
 
     await agent.cancel({ sessionId: "test-session" });
     expect(agent.sessions["test-session"]?.pendingOrphanResults).toBe(1);
+    expect(agent.sessions["test-session"]?.pendingEmptyInterruptionDiagnosticCommands).toEqual(
+      new Set([survivingUuid]),
+    );
     const compact = agent.prompt({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "/compact" }],
@@ -13309,6 +14752,91 @@ describe("turn steering (_session/steering)", () => {
     expect(agent.sessions["test-session"].pendingExitPlanModeInterruption).toBeUndefined();
   });
 
+  it("does not fail a replacement prompt on the cancelled prompt's late SDK diagnostic", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const original = await iter.next();
+        // The first prompt is cancelled before the SDK echoes it. Once startup
+        // unblocks, the CLI still replays that prompt, its interruption marker,
+        // and the replacement prompt before emitting the cancelled cycle's
+        // diagnostic result — the ordering observed in the raw Claude session.
+        await gate;
+        const replacement = await iter.next();
+        yield userEcho(original.value);
+        yield userEcho({
+          uuid: randomUUID(),
+          message: { role: "user", content: "[Request interrupted by user]" },
+        });
+        yield userEcho(replacement.value);
+        yield {
+          ...createResultMessage(),
+          subtype: "success",
+          is_error: true,
+          result: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+        };
+        yield createAssistantText("replacement answer");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(
+      () =>
+        agent.sessions["test-session"]?.turnQueue?.length === 1 &&
+        agent.sessions["test-session"]?.activeTurn == null,
+    );
+    await agent.cancel({ sessionId: "test-session" });
+    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    release();
+
+    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(JSON.stringify(updates)).not.toContain("[Request interrupted by user]");
+  });
+
+  it("does not hide an empty user-interruption diagnostic without a cancelled predecessor", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const original = await iter.next();
+        yield userEcho(original.value);
+        yield {
+          ...createResultMessage(),
+          subtype: "success",
+          is_error: true,
+          result: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+        };
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "first" }] }),
+    ).rejects.toThrow("[ede_diagnostic]");
+  });
+
   // The other steer ordering: the cycle had already finished when the steer
   // landed, so nothing was aborted and its result is a natural one — followed by
   // its own idle, before the steered message is picked up. Settling on that idle
@@ -15476,7 +17004,7 @@ describe("tool_progress heartbeats", () => {
   // report under `agent_<assistant_message_id>`, with the retrying Agent call's
   // real id in `parent_tool_use_id`. Resolving via the suffix alone dropped
   // them, leaving a stalled spawn with no explanation.
-  it("reports a subagent retry beat against the Agent call that is retrying", async () => {
+  it("reports a subagent retry beat against the Agent call without native negotiation", async () => {
     const sent = await run(
       [
         {
@@ -15522,6 +17050,26 @@ describe("tool_progress heartbeats", () => {
 
     expect(sent.map((u) => u.toolCallId)).toEqual(["toolu_inner"]);
   });
+
+  it("keeps a child tool beat in the legacy flattened transcript", async () => {
+    const sent = await run(
+      [
+        {
+          type: "system",
+          subtype: "task_started",
+          task_id: "agent-1",
+          tool_use_id: "toolu_task",
+          subagent_type: "general-purpose",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        beat("toolu_inner", "toolu_task", { heartbeat: undefined }),
+      ],
+      ["toolu_task", "toolu_inner"],
+    );
+
+    expect(sent.map((update) => update.toolCallId)).toEqual(["toolu_inner"]);
+  });
 });
 
 describe("permission_denied", () => {
@@ -15535,7 +17083,11 @@ describe("permission_denied", () => {
   >;
 
   /** Run a turn carrying `messages` and return the updates it produced. */
-  async function run(messages: any[], overrides: Record<string, any> = {}) {
+  async function run(
+    messages: any[],
+    overrides: Record<string, any> = {},
+    clientCapabilities?: ClientCapabilities,
+  ) {
     const updates: SessionNotification["update"][] = [];
     const mockClient = {
       sessionUpdate: async (n: SessionNotification) => {
@@ -15543,6 +17095,7 @@ describe("permission_denied", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    agent.clientCapabilities = clientCapabilities;
     const input = new Pushable<any>();
     async function* messageGenerator() {
       const { value, done } = await input[Symbol.asyncIterator]().next();
@@ -15722,7 +17275,7 @@ describe("permission_denied", () => {
   // call that spawned it, so without the `liveBackgroundTasks` lookup the update
   // lands at the top level while the tool_call it resolves sits in the
   // subagent's transcript.
-  it("attributes a subagent denial to the Agent call that spawned it", async () => {
+  it("attributes a legacy subagent denial to the Agent call that spawned it", async () => {
     const updates = await run([
       {
         type: "system",
@@ -15743,10 +17296,7 @@ describe("permission_denied", () => {
     });
   });
 
-  // The attribution rests on `task_started` having been seen for the agent id.
-  // If it wasn't, the denial still resolves the call — unattributed beats
-  // dropped.
-  it("still resolves a subagent denial when the parent is unknown", async () => {
+  it("still resolves a legacy subagent denial when the parent is unknown", async () => {
     const updates = await run([
       toolUse("toolu_inner", "toolu_agent"),
       denial("toolu_inner", { agent_id: "agent-unknown" }),
@@ -15755,5 +17305,18 @@ describe("permission_denied", () => {
     const sent = denials(updates);
     expect(sent).toHaveLength(1);
     expect((sent[0]._meta as any).claudeCode).not.toHaveProperty("parentToolUseId");
+  });
+
+  it("uses eager child ownership when native lineage has not arrived yet", async () => {
+    const updates = await run(
+      [denial("toolu_inner", { agent_id: "agent-racing" })],
+      {
+        emittedToolCalls: new Set(["toolu_inner"]),
+        eagerToolCallSessions: new Map([["toolu_inner", "child-session"]]),
+      },
+      { subagents: {} } as ClientCapabilities & { subagents: Record<string, never> },
+    );
+
+    expect(denials(updates)).toHaveLength(1);
   });
 });

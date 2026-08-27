@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { RequestError, SessionNotification } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import * as fs from "node:fs";
@@ -270,7 +271,7 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.forwardSubagentText).toBe(false);
     });
 
-    it("preserves the pre-existing caller-provided SDK option", async () => {
+    it("preserves caller-provided legacy transcript forwarding", async () => {
       await agent.newSession({
         cwd: process.cwd(),
         mcpServers: [],
@@ -280,10 +281,24 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.forwardSubagentText).toBe(true);
     });
 
-    it("enables SDK forwarding when the ACP client advertises support", async () => {
+    it("accepts the legacy transcript extension", async () => {
       await agent.initialize({
         protocolVersion: 1,
         clientCapabilities: { _meta: { "subagent-transcript": true } },
+      });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { forwardSubagentText: false } } },
+      });
+
+      expect(capturedOptions!.forwardSubagentText).toBe(true);
+    });
+
+    it("enables SDK forwarding after native ACP negotiation", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities,
       });
       await agent.newSession({
         cwd: process.cwd(),
