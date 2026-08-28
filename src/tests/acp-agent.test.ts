@@ -52,6 +52,7 @@ import { SessionTitles } from "../session-titles.js";
 import { Pushable } from "../utils.js";
 import {
   deleteSession,
+  forkSession,
   getSessionInfo,
   getSessionMessages,
   PermissionUpdate,
@@ -78,6 +79,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   return {
     ...actual,
     deleteSession: vi.fn(),
+    forkSession: vi.fn(),
     getSessionInfo: vi.fn(),
     // Delegates to the real implementation so integration tests that read
     // actual transcripts keep working; unit tests override per-call with
@@ -7632,6 +7634,57 @@ describe("logout", () => {
         "nativeSubagentSessions",
         "asyncTasks",
       ],
+    });
+  });
+});
+
+describe("session/fork", () => {
+  it("forks the latest turn in the requested workspace", async () => {
+    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+
+    const response = await agent.unstable_forkSession({
+      sessionId: "source-id",
+      cwd: "/workspace",
+      additionalDirectories: ["/workspace/extra"],
+      mcpServers: [],
+    });
+
+    expect(response.sessionId).toBe("fork-id");
+    expect(forkSession).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+  });
+
+  it("forks at an AIR message id through the current SDK", async () => {
+    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "assistant-uuid",
+        session_id: "source-id",
+        message: { id: "msg_123", role: "assistant", content: [] },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+    ]);
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+    const meta = {
+      jetbrains: { air: { fork: { version: 1, messageId: "msg_123:segment:0" } } },
+    };
+    const response = await agent.unstable_forkSession({
+      sessionId: "source-id",
+      cwd: "/workspace",
+      additionalDirectories: ["/workspace/extra"],
+      mcpServers: [],
+      _meta: meta,
+    });
+
+    expect(response.sessionId).toBe("fork-id");
+    expect(getSessionMessages).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(forkSession).toHaveBeenCalledWith("source-id", {
+      dir: "/workspace",
+      upToMessageId: "assistant-uuid",
     });
   });
 });
